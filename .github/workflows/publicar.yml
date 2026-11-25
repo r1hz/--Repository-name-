@@ -1,0 +1,61 @@
+name: Publicar
+
+# A cada push na main, gera o GeolabTITools.exe e atualiza a release "latest" (sempre a versão mais nova).
+# Ao criar uma tag (ex.: v0.12), gera também uma release fixa dessa versão.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publicar (arquivo único, com o .NET embutido)
+        run: dotnet publish ResetExplode.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o dist -nologo
+
+      - name: Publicar versão de 32 bits (Windows x86)
+        run: dotnet publish ResetExplode.csproj -c Release -r win-x86 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o dist32 -nologo
+
+      - name: Montar pacotes e hashes
+        shell: pwsh
+        run: |
+          Copy-Item LEIA-ME.txt dist/LEIA-ME.txt
+          Compress-Archive -Path dist/GeolabTITools.exe, dist/LEIA-ME.txt -DestinationPath GeolabTITools.zip
+          Copy-Item dist32/GeolabTITools.exe dist32/GeolabTITools-x86.exe
+          Compress-Archive -Path dist32/GeolabTITools-x86.exe, dist/LEIA-ME.txt -DestinationPath GeolabTITools-x86.zip
+          # SHA-256 de cada exe, para quem quiser conferir o arquivo baixado (veja SECURITY.md)
+          (Get-FileHash dist/GeolabTITools.exe -Algorithm SHA256).Hash.ToLower() + "  GeolabTITools.exe" | Out-File SHA256SUMS.txt -Encoding ascii
+          (Get-FileHash dist32/GeolabTITools-x86.exe -Algorithm SHA256).Hash.ToLower() + "  GeolabTITools-x86.exe" | Out-File SHA256SUMS.txt -Encoding ascii -Append
+
+      - name: Atualizar release "latest"
+        if: startsWith(github.ref, 'refs/heads/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $sha = "$env:GITHUB_SHA".Substring(0, 7)
+          gh release delete latest --cleanup-tag --yes
+          gh release create latest GeolabTITools.zip GeolabTITools-x86.zip dist/GeolabTITools.exe dist32/GeolabTITools-x86.exe SHA256SUMS.txt --target $env:GITHUB_SHA --latest --title "GEOLAB TI TOOLS (versão mais recente)" --notes-file NOVIDADES.md
+
+      - name: Release da versão (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME GeolabTITools.zip GeolabTITools-x86.zip dist/GeolabTITools.exe dist32/GeolabTITools-x86.exe SHA256SUMS.txt --title "GEOLAB TI TOOLS $env:GITHUB_REF_NAME" --generate-notes --latest=false
