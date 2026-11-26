@@ -2,6 +2,7 @@ using System.IO;
 using System.Management;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
+using GeolabTITools.Application.Features.SystemInfo.DTOs;
 
 namespace ResetExplode;
 

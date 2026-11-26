@@ -1,4 +1,4 @@
-﻿# GEOLAB TI TOOLS — v0.16
+# GEOLAB TI TOOLS — v0.17
 
 > **Distribuição:** use os binários fornecidos pela GEOLAB TI TOOLS.
 > O app roda como administrador; não use versões baixadas de outros lugares.
@@ -6,7 +6,12 @@
 > **Contribuições:** este projeto não aceita pull requests. Fique à vontade para fazer um *fork* e modificar a sua própria cópia
 > (licença [MIT](LICENSE): mantenha o aviso de copyright).
 
-## Novidades da v0.16
+## Novidades da v0.17
+- **Dashboard e GEOLAB BENCH** mostram o clock dos núcleos ativos da CPU; o registro do stress test pode ser redimensionado e mostra CPU, GPU e RAM.
+- **Sistema e Discos** exibem mais informações do Windows e incluem verificação de setores defeituosos em modo somente leitura e cancelável.
+- **Publicação** inclui hashes SHA-256 e executáveis para Windows x64 e x86.
+
+## Destaques da v0.16
 - **Inicialização** (GEOLAB FERRAMENTAS): veja, desative ou remova os programas que abrem junto com o Windows, com opção de desfazer.
 - **GEOLAB MAKER** (nova categoria): Portas COM (fantasmas e números COM presos, que saiu de Otimização) e Drivers seriais
   (CH340, CP2102, FTDI, Prolific e Arduino: diagnóstico, reinstalar, trocar ou remover versão do driver, Arduino IDE).
@@ -148,3 +153,15 @@ Ao criar uma tag (`git tag v0.12` e `git push --tags`), também sai uma release 
 ## Licença
 
 MIT — veja o arquivo [LICENSE](LICENSE).
+
+## Arquitetura e desenvolvimento
+
+A arquitetura está sendo migrada gradualmente. O WPF ainda é compilado por `ResetExplode.csproj` na raiz; Domain, Application e Infrastructure são projetos em `src/`. DiskAnalyzer e a tela Sistema já têm ViewModels, e os contratos/adaptadores migrados estão descritos em [ARCHITECTURE.md](ARCHITECTURE.md). A documentação distingue essas fatias do code-behind e dos serviços legados ainda pendentes.
+
+Para compilar em Release no Windows com .NET 8:
+
+```powershell
+dotnet build ResetExplode.csproj -c Release
+```
+
+Consulte [ARCHITECTURE.md](ARCHITECTURE.md) para dependências, DI, testes disponíveis e publicação. Alterações no Registro, drivers, processos e benchmarks de hardware precisam ser testadas em ambiente apropriado; o build não executa essas operações.

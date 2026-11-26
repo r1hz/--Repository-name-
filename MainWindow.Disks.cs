@@ -5,6 +5,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Threading;
+using GeolabTITools.Application.Features.SystemInfo.DTOs;
 
 namespace ResetExplode;
 
@@ -155,7 +156,7 @@ public partial class MainWindow
                 Machine = Environment.MachineName,
                 AppVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "",
                 LogoBase64 = LoadLogoBase64(),
-                System = (InfoCategories.ItemsSource as IEnumerable<InfoNode> ?? Enumerable.Empty<InfoNode>())
+                System = _systemViewModel.Categories
                          .Select(ReportBuilder.ToNode).Where(n => n != null).Cast<ReportNode>().ToList(),
                 Gpus = _gpus.Select(g => new ReportGpu(g.Name, g.Subtitle,
                          g.Sections.Select(ReportBuilder.ToNode).Where(n => n != null).Cast<ReportNode>().ToList())).ToList(),
@@ -172,7 +173,7 @@ public partial class MainWindow
             string text = json ? ReportBuilder.Json(data) : ReportBuilder.Html(data);
             await File.WriteAllTextAsync(path, text, new UTF8Encoding(true));
 
-            SystemSub.Text = $"Relatório salvo em {path}";
+            _systemViewModel.StatusText = $"Relatório salvo em {path}";
             try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); } catch { }
         }
         catch (Exception ex)
