@@ -39,7 +39,7 @@ public partial class MainWindow
 
     private void RefreshMakerDevices()
     {
-        try { _makerDevices = MakerDrivers.ConnectedDevices(); }
+        try { _makerDevices = _makerDrivers.ConnectedDevices(); }
         catch (Exception ex) { MakerStatus.Text = $"Não foi possível listar os dispositivos: {ex.Message}"; _makerDevices = new(); }
         MakerDevices.ItemsSource = _makerDevices;
         MakerNoDevices.Visibility = _makerDevices.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -48,20 +48,20 @@ public partial class MainWindow
     private async Task RefreshMakerPackagesAsync()
     {
         List<SerialDriverPackage> pkgs;
-        try { pkgs = await MakerDrivers.DriverPackagesAsync(_makerDevices); }
+        try { pkgs = await _makerDrivers.DriverPackagesAsync(_makerDevices); }
         catch (Exception ex) { MakerStatus.Text = $"Não foi possível ler os drivers: {ex.Message}"; pkgs = new(); }
         MakerPackages.ItemsSource = pkgs;
         MakerNoPackages.Visibility = pkgs.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         MakerBundled.ItemsSource = MakerDrivers.Bundled(pkgs);
-        BtnMakerRestore.IsEnabled = MakerDrivers.HasBackups;
+        BtnMakerRestore.IsEnabled = _makerDrivers.HasBackups;
     }
 
     private void RefreshMakerIde()
     {
-        string? v = MakerDrivers.IdeVersion();
-        MakerIde.Text = v != null ? $"Arduino IDE {v} instalada{(MakerDrivers.IdeRunning ? " · aberta agora" : "")}." : "Arduino IDE não instalada.";
+        string? v = _makerDrivers.IdeVersion();
+        MakerIde.Text = v != null ? $"Arduino IDE {v} instalada{(_makerDrivers.IdeRunning ? " · aberta agora" : "")}." : "Arduino IDE não instalada.";
         BtnMakerIde.Content = v != null ? "ATUALIZAR A IDE" : "INSTALAR A IDE";
-        var holders = MakerDrivers.RunningPortHolders();
+        var holders = _makerDrivers.RunningPortHolders();
         MakerHolders.Text = holders.Count == 0 ? "Nenhum programa conhecido prendendo portas COM agora."
                           : "Podem estar prendendo a porta: " + string.Join(", ", holders.Select(p => p.ProcessName).Distinct()) + ".";
     }
@@ -71,7 +71,7 @@ public partial class MainWindow
         if (sender is not FrameworkElement { Tag: SerialDeviceRow row } || _makerBusy) return;
         if (!RequireAdmin()) return;
         MakerBusy(true, $"Reinstalando {row.Name}…");
-        try { MakerStatus.Text = await MakerDrivers.ReinstallAsync(row.Device); }
+        try { MakerStatus.Text = await _makerDrivers.ReinstallAsync(row.Device); }
         catch (Exception ex) { MakerStatus.Text = $"Falhou: {ex.Message}"; }
         await Task.Delay(1500); // dá tempo do Windows terminar a instalação antes de reler
         RefreshMakerDevices();
@@ -105,7 +105,7 @@ public partial class MainWindow
         foreach (var c in chips)
         {
             MakerBusy(true, $"Instalando o driver do {c.Name}…");
-            try { results.Add(await MakerDrivers.InstallBundledAsync(c)); }
+            try { results.Add(await _makerDrivers.InstallBundledAsync(c)); }
             catch (Exception ex) { results.Add($"{c.Name}: falhou ({ex.Message})"); }
         }
         await Task.Delay(1000);
@@ -125,7 +125,7 @@ public partial class MainWindow
                                 "GEOLAB MAKER", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (r != MessageBoxResult.Yes) return;
         MakerBusy(true, $"Removendo {p.Title}…");
-        try { MakerStatus.Text = await MakerDrivers.RemovePackageAsync(p); }
+        try { MakerStatus.Text = await _makerDrivers.RemovePackageAsync(p); }
         catch (Exception ex) { MakerStatus.Text = $"Falhou: {ex.Message}"; }
         await Task.Delay(1000);
         RefreshMakerDevices();
@@ -140,7 +140,7 @@ public partial class MainWindow
                                 MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (r != MessageBoxResult.Yes) return;
         MakerBusy(true, "Restaurando drivers…");
-        try { MakerStatus.Text = await MakerDrivers.RestoreBackupsAsync(); }
+        try { MakerStatus.Text = await _makerDrivers.RestoreBackupsAsync(); }
         catch (Exception ex) { MakerStatus.Text = $"Falhou: {ex.Message}"; }
         RefreshMakerDevices();
         await RefreshMakerPackagesAsync();
@@ -155,12 +155,12 @@ public partial class MainWindow
             MakerIdeResult.Text = "O winget não foi encontrado. Atualize o Instalador de Aplicativo pela Microsoft Store ou baixe a Arduino IDE no site oficial.";
             return;
         }
-        if (MakerDrivers.IdeRunning)
+        if (_makerDrivers.IdeRunning)
         {
             MakerIdeResult.Text = "Feche a Arduino IDE antes (salve o sketch) e clique de novo.";
             return;
         }
-        bool installed = MakerDrivers.IdeVersion() != null;
+        bool installed = _makerDrivers.IdeVersion() != null;
         MakerBusy(true);
         MakerIdeResult.Text = installed ? "Atualizando a Arduino IDE… (pode levar alguns minutos)" : "Instalando a Arduino IDE… (pode levar alguns minutos)";
         try
@@ -176,23 +176,22 @@ public partial class MainWindow
 
     private void BtnMakerHolders_Click(object sender, RoutedEventArgs e)
     {
-        var procs = MakerDrivers.RunningPortHolders();
+        var procs = _makerDrivers.RunningPortHolders();
         if (procs.Count == 0) { MakerIdeResult.Text = "Nenhum programa conhecido prendendo portas COM."; RefreshMakerIde(); return; }
         var names = procs.Select(p => p.ProcessName).Distinct().ToList();
         var r = MessageBox.Show("Fechar estes programas? Trabalho não salvo neles pode ser perdido.\n\n" + string.Join("\n", names.Select(n => "  • " + n)),
                                 "GEOLAB MAKER", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (r != MessageBoxResult.Yes) return;
         int closed = 0;
-        foreach (var p in procs)
-            try { p.Kill(entireProcessTree: true); closed++; } catch { }
+        closed = _makerDrivers.TerminatePortHolders(procs);
         MakerIdeResult.Text = $"{closed} programas fechados. Tente o upload de novo.";
         RefreshMakerIde();
     }
 
     private void BtnMakerCache_Click(object sender, RoutedEventArgs e)
     {
-        if (MakerDrivers.IdeRunning) { MakerIdeResult.Text = "Feche a Arduino IDE antes de limpar o cache."; return; }
-        try { MakerIdeResult.Text = MakerDrivers.ClearIdeCache(); }
+        if (_makerDrivers.IdeRunning) { MakerIdeResult.Text = "Feche a Arduino IDE antes de limpar o cache."; return; }
+        try { MakerIdeResult.Text = _makerDrivers.ClearIdeCache(); }
         catch (Exception ex) { MakerIdeResult.Text = $"Falhou: {ex.Message}"; }
     }
 }

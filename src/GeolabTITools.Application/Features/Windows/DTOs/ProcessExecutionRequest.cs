@@ -6,4 +6,7 @@ public sealed record ProcessExecutionRequest(
     string? WorkingDirectory = null,
     bool RunAsAdministrator = false,
     bool WaitForExit = true,
-    bool CaptureOutput = false);
+    bool CaptureOutput = false,
+    IProgress<string>? StandardOutputProgress = null,
+    System.Text.Encoding? StandardOutputEncoding = null,
+    System.Text.Encoding? StandardErrorEncoding = null);

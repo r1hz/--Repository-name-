@@ -12,6 +12,7 @@ using LibreHardwareMonitor.Hardware;
 using ResetExplode.DiskAnalyzer;
 using GeolabTITools.Application.Features.SystemInfo.Contracts;
 using GeolabTITools.Application.Features.SystemInfo.DTOs;
+using GeolabTITools.Application.Features.Windows.Contracts;
 using ResetExplode.Presentation.ViewModels.System;
 
 namespace ResetExplode;
@@ -20,6 +21,14 @@ public partial class MainWindow : Window
 {
     private readonly SensorMonitor _monitor;
     private readonly SystemViewModel _systemViewModel;
+    private readonly WindowsTweaks _windowsTweaks;
+    private readonly StartupManager _startupManager;
+    private readonly DriverManager _driverManager;
+    private readonly MakerDrivers _makerDrivers;
+    private readonly Optimizer _optimizer;
+    private readonly IUsbDeviceService _usbDevices;
+    private readonly IComPortReservationService _comPortReservations;
+    private readonly List<Tweak> _tweaks;
     private readonly DispatcherTimer _timer;
     private readonly ICollectionView _view;
     private string? _category;   // filtro por chip (null = todos)
@@ -53,7 +62,6 @@ public partial class MainWindow : Window
 
     // GEOLAB OTIMIZA
     private List<BackgroundApp> _apps = new();
-    private readonly List<Tweak> _tweaks = WindowsTweaks.All(); // só as definições; o estado é lido ao abrir a página
     private bool _optInit;
     private bool _heroBarAnimationRunning;
 
@@ -80,10 +88,18 @@ public partial class MainWindow : Window
     private Brush Muted => (Brush)FindResource("Muted");
     private Brush Card => (Brush)FindResource("Card");
 
-    public MainWindow(DiskAnalyzerViewModel diskAnalyzerViewModel, SystemViewModel systemViewModel)
+    public MainWindow(DiskAnalyzerViewModel diskAnalyzerViewModel, SystemViewModel systemViewModel, WindowsTweaks windowsTweaks, StartupManager startupManager, DriverManager driverManager, MakerDrivers makerDrivers, Optimizer optimizer, IUsbDeviceService usbDevices, IComPortReservationService comPortReservations)
     {
         InitializeComponent();
         _systemViewModel = systemViewModel;
+        _windowsTweaks = windowsTweaks;
+        _startupManager = startupManager;
+        _driverManager = driverManager;
+        _makerDrivers = makerDrivers;
+        _optimizer = optimizer;
+        _usbDevices = usbDevices;
+        _comPortReservations = comPortReservations;
+        _tweaks = _windowsTweaks.All(); // só as definições; o estado é lido ao abrir a página
         PageDiskAnalyzer.DataContext = diskAnalyzerViewModel;
         PageSystem.DataContext = systemViewModel;
         ThemeManager.Apply(_settings.LightTheme);
@@ -532,7 +548,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var list = await Task.Run(UsbCleaner.List);
+            var list = await Task.Run(() => _usbDevices.ListDevices().Select(UsbDevice.FromInfo).ToList());
             _usbPresent = list.Where(d => d.Present).GroupBy(d => d.InstanceId).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
         }
         catch { }
@@ -587,7 +603,7 @@ public partial class MainWindow : Window
     private async void DiffUsb()
     {
         List<UsbDevice> list;
-        try { list = await Task.Run(UsbCleaner.List); } catch { return; }
+        try { list = await Task.Run(() => _usbDevices.ListDevices().Select(UsbDevice.FromInfo).ToList()); } catch { return; }
         var present = list.Where(d => d.Present).GroupBy(d => d.InstanceId)
                           .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
         var added = present.Values.Where(d => !_usbPresent.ContainsKey(d.InstanceId)).ToList();
@@ -808,7 +824,7 @@ public partial class MainWindow : Window
 
     private void UpdateRamStatus()
     {
-        var (total, avail) = Optimizer.MemoryStatus();
+        var (total, avail) = _optimizer.MemoryStatus();
         if (total == 0) return;
         double used = total - avail;
         OptRamText.Text = $"{used / 1073741824.0:0.0} de {total / 1073741824.0:0.0} GB · {used / total:P0}";
@@ -817,7 +833,7 @@ public partial class MainWindow : Window
 
     private void RefreshApps()
     {
-        _apps = Optimizer.ListApps();
+        _apps = _optimizer.ListApps();
         OptApps.ItemsSource = _apps;
     }
 
@@ -838,8 +854,8 @@ public partial class MainWindow : Window
         BtnOptimize.IsEnabled = false;
         BtnOptimize.Content = "OTIMIZANDO…";
         OptResult.Text = "";
-        var closeResult = await Task.Run(() => Optimizer.CloseApps(toClose));
-        var mem = await Task.Run(Optimizer.CleanMemory); // depois de fechar, para contar a memória liberada por eles também
+        var closeResult = await Task.Run(() => _optimizer.CloseApps(toClose));
+        var mem = await Task.Run(_optimizer.CleanMemory); // depois de fechar, para contar a memória liberada por eles também
         BtnOptimize.IsEnabled = true;
         BtnOptimize.Content = "GEOLAB OTIMIZA";
 
@@ -882,7 +898,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            _usb = UsbCleaner.List();
+            _usb = _usbDevices.ListDevices().Select(UsbDevice.FromInfo).ToList();
         }
         catch (Exception ex) { UsbResult.Text = $"Não foi possível listar os dispositivos: {ex.Message}"; return; }
 
@@ -900,7 +916,8 @@ public partial class MainWindow : Window
 
         try
         {
-            var (reserved, inUse) = UsbCleaner.ComStatus();
+            var comStatus = _comPortReservations.ReadComPortStatus();
+            var (reserved, inUse) = (comStatus.Reserved, comStatus.InUse);
             string R(IEnumerable<int> l) => l.Any() ? string.Join(", ", l.Select(n => $"COM{n}")) : "nenhum";
             UsbComDb.Text = $"{reserved.Count} reservados: {R(reserved)}\nEm uso agora: {R(inUse)}";
         }
@@ -933,7 +950,7 @@ public partial class MainWindow : Window
 
         BtnUsbRemove.IsEnabled = false;
         UsbResult.Text = "Removendo…";
-        var (removed, failed) = await Task.Run(() => UsbCleaner.Remove(sel.Select(d => d.InstanceId)));
+        var (removed, failed) = await Task.Run(() => _usbDevices.RemoveAbsentDevices(sel.Select(d => d.InstanceId)));
         BtnUsbRemove.IsEnabled = true;
         UsbResult.Text = $"{removed} registros removidos." +
                          (failed.Count > 0 ? $" Não removidos: {string.Join("; ", failed.Take(5))}" : "") +
@@ -944,7 +961,8 @@ public partial class MainWindow : Window
     private void BtnComDb_Click(object sender, RoutedEventArgs e)
     {
         if (!RequireAdmin()) return;
-        var (reserved, inUse) = UsbCleaner.ComStatus();
+        var comStatus = _comPortReservations.ReadComPortStatus();
+            var (reserved, inUse) = (comStatus.Reserved, comStatus.InUse);
         var freed = reserved.Except(inUse).ToList();
         if (freed.Count == 0) { UsbResult.Text = "Nenhum número COM preso: todos os reservados estão em uso."; return; }
         var r = MessageBox.Show($"Liberar {freed.Count} números COM presos por dispositivos que não estão conectados?\n\n" +
@@ -956,7 +974,7 @@ public partial class MainWindow : Window
         if (r != MessageBoxResult.Yes) return;
         try
         {
-            var old = UsbCleaner.RebuildComDb();
+            var old = _comPortReservations.RebuildComPortDatabase();
             _settings.ComDbBackup ??= old; // guarda o original da primeira vez
             _settings.Save();
             UsbResult.Text = $"Liberados: {string.Join(", ", freed.Select(n => $"COM{n}"))}. Plugue a placa de novo para ela pegar um número baixo.";
@@ -970,7 +988,7 @@ public partial class MainWindow : Window
         if (_settings.ComDbBackup == null || !RequireAdmin()) return;
         try
         {
-            UsbCleaner.RestoreComDb(_settings.ComDbBackup);
+            _comPortReservations.RestoreComPortDatabase(_settings.ComDbBackup);
             _settings.ComDbBackup = null;
             _settings.Save();
             UsbResult.Text = "Reservas de números COM restauradas para como estavam.";
@@ -991,7 +1009,7 @@ public partial class MainWindow : Window
                                 "GEOLAB OTIMIZA", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (r != MessageBoxResult.Yes) return;
         bool restart = _tweaks.Any(t => t.NeedsRestart && _settings.TweakBackup.ContainsKey(t.Id));
-        WindowsTweaks.RestoreAll(_tweaks, _settings);
+        _windowsTweaks.RestoreAll(_tweaks, _settings);
         foreach (var t in _tweaks) { t.Refresh(); t.Status = "Restaurado."; }
         if (restart) MessageBox.Show("Alguns ajustes só voltam ao original depois de reiniciar o PC.", "GEOLAB OTIMIZA");
     }
@@ -1562,7 +1580,7 @@ public partial class MainWindow : Window
     /// <summary>Linha com CPU, GPU e RAM da máquina no topo do registro, para constar em capturas de tela.</summary>
     private void UpdateStressHardware()
     {
-        var (total, _) = Optimizer.MemoryStatus();
+        var (total, _) = _optimizer.MemoryStatus();
         string gpus = _gpus.Count > 0 ? string.Join(" + ", _gpus.Select(g => g.Name)) : "—";
         string ram = total > 0 ? $"{total / 1073741824.0:0.#} GB" : "—";
         StressHw.Text = $"CPU: {(_cpuName.Length > 0 ? _cpuName : "—")}  ·  GPU: {gpus}  ·  RAM: {ram}";

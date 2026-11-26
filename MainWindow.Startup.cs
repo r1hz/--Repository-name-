@@ -9,7 +9,7 @@ public partial class MainWindow
     private void ScanStartup()
     {
         List<StartupEntry> list;
-        try { list = StartupManager.List(); }
+        try { list = _startupManager.List(); }
         catch (Exception ex) { StartupResult.Text = $"Não foi possível listar: {ex.Message}"; return; }
 
         StartupList.ItemsSource = list;
@@ -34,7 +34,7 @@ public partial class MainWindow
         if (item.Machine && !RequireAdmin()) { box.IsChecked = item.Enabled; return; }
         try
         {
-            StartupManager.SetEnabled(item, turnOn);
+            _startupManager.SetEnabled(item, turnOn);
             StartupResult.Text = $"{item.Name}: {(turnOn ? "ativado" : "desativado")}. Vale na próxima inicialização do Windows.";
         }
         catch (Exception ex) { StartupResult.Text = $"{item.Name}: falhou ({ex.Message})."; }
@@ -53,7 +53,7 @@ public partial class MainWindow
         if (r != MessageBoxResult.Yes) return;
         try
         {
-            _settings.StartupRemoved.Add(StartupManager.Remove(item));
+            _settings.StartupRemoved.Add(_startupManager.Remove(item));
             _settings.Save();
             StartupResult.Text = $"{item.Name} removido da inicialização.";
         }
@@ -75,7 +75,7 @@ public partial class MainWindow
         var failed = new List<string>();
         foreach (var b in removed.ToList())
         {
-            try { StartupManager.Restore(b); removed.Remove(b); }
+            try { _startupManager.Restore(b); removed.Remove(b); }
             catch (Exception ex) { failed.Add($"{b.Name} ({ex.Message})"); }
         }
         _settings.Save();

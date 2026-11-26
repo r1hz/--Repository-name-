@@ -150,7 +150,7 @@ public partial class MainWindow
                          F(MainGpuTemp(), "0", " °C"), F(MainGpuLoad(), "0", " %"), clk is uint c ? $"{c} MHz" : "—",
                          F(MainGpuPower(), "0", " W"), "PageGpu"));
         }
-        var (total, avail) = Optimizer.MemoryStatus();
+        var (total, avail) = _optimizer.MemoryStatus();
         if (total > 0)
         {
             double used = total - avail;
@@ -299,7 +299,7 @@ public partial class MainWindow
 
     private void UpdateDashRings()
     {
-        var (total, avail) = Optimizer.MemoryStatus();
+        var (total, avail) = _optimizer.MemoryStatus();
         double ram = total > 0 ? (double)(total - avail) / total : 0;
         double? vram = null;
         if (_gpus.Count > 0 && _gpus[0].NvmlHandle != IntPtr.Zero && Nvml.MemoryInfo(_gpus[0].NvmlHandle) is Nvml.Memory m && m.Total > 0)
@@ -379,7 +379,8 @@ public partial class MainWindow
 
         try
         {
-            var (reserved, inUse) = UsbCleaner.ComStatus();
+            var comStatus = _comPortReservations.ReadComPortStatus();
+            var (reserved, inUse) = (comStatus.Reserved, comStatus.InUse);
             int stuck = reserved.Except(inUse).Count();
             list.Add(Item(stuck == 0, "Portas COM livres", "Nenhum número COM preso.",
                           $"{stuck} números presos por dispositivos antigos."));

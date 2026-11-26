@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Windows;
+using GeolabTITools.Application.Features.Windows.DTOs;
 
 namespace ResetExplode;
 
@@ -9,7 +10,7 @@ public partial class MainWindow
     private bool _drvInit, _drvBusy;
     private List<GpuDriverStatus> _drvGpus = new();
     private BoardInfo _drvBoardInfo = new();
-    private List<WuDriver> _drvWu = new();
+    private List<WindowsUpdateDriverInfo> _drvWu = new();
     private CancellationTokenSource? _drvCts;
 
     private void InitDriver()
@@ -43,12 +44,12 @@ public partial class MainWindow
         try
         {
             DrvSet("Lendo drivers instalados…", 0.1);
-            var inv = await Task.Run(DriverManager.Inventory);
+            var inv = await _driverManager.InventoryAsync(_drvCts.Token);
             DrvList.ItemsSource = inv;
 
             DrvSet("Lendo placa de vídeo e placa-mãe…", 0.3);
-            _drvGpus = await Task.Run(DriverManager.ReadGpus);
-            _drvBoardInfo = await Task.Run(DriverManager.ReadBoard);
+            _drvGpus = await _driverManager.ReadGpusAsync(_drvCts.Token);
+            _drvBoardInfo = await _driverManager.ReadBoardAsync(_drvCts.Token);
             ShowBoard();
 
             bool studio = DrvStudio.IsChecked == true;
@@ -56,8 +57,8 @@ public partial class MainWindow
             foreach (var g in _drvGpus)
             {
                 DrvSet($"Consultando {g.Vendor.ToUpperInvariant()} para {g.GpuName}…", 0.4 + 0.5 * i / Math.Max(1, _drvGpus.Count));
-                if (g.Vendor == "NVIDIA") await DriverManager.CheckNvidiaAsync(g, studio, _drvCts.Token);
-                else if (g.Vendor == "AMD") await DriverManager.CheckAmdAsync(g, _drvCts.Token);
+                if (g.Vendor == "NVIDIA") await _driverManager.CheckNvidiaAsync(g, studio, _drvCts.Token);
+                else if (g.Vendor == "AMD") await _driverManager.CheckAmdAsync(g, _drvCts.Token);
                 else if (g.Vendor == "Intel") g.Message = $"{g.Vendor}: use a página oficial para ver a versão mais recente (instalado: {g.Installed}).";
                 else g.Message = "Fabricante não reconhecido.";
                 i++;
@@ -106,7 +107,7 @@ public partial class MainWindow
         _drvCts = new CancellationTokenSource();
         try
         {
-            string r = await DriverManager.DownloadAndLaunchAsync(g, (t, f) => Dispatcher.BeginInvoke(new Action(() => DrvSet(t, f))), _drvCts.Token);
+            string r = await _driverManager.DownloadAndLaunchAsync(g, (t, f) => Dispatcher.BeginInvoke(new Action(() => DrvSet(t, f))), _drvCts.Token);
             DrvSet(r, 1);
         }
         catch (Exception ex) { DrvSet("Falhou: " + ex.Message, 0); }
@@ -120,7 +121,7 @@ public partial class MainWindow
         DrvSet("Procurando drivers no Windows Update (pode levar 1 minuto)…", 0.3);
         try
         {
-            _drvWu = await DriverManager.SearchWindowsUpdateAsync();
+            _drvWu = (await _driverManager.SearchWindowsUpdateAsync()).ToList();
             DrvWuList.Text = _drvWu.Count == 0
                 ? "Nenhum driver novo no Windows Update."
                 : string.Join("\n", _drvWu.Select(w => "• " + w.Title + (w.SizeBytes > 0 ? $" ({w.SizeBytes / 1048576.0:F0} MB)" : "")));
@@ -138,7 +139,7 @@ public partial class MainWindow
         DrvBusy(true);
         try
         {
-            string r = await DriverManager.InstallWindowsUpdateAsync(_drvWu, t => Dispatcher.BeginInvoke(new Action(() => DrvSet(t, 0.5))));
+            string r = await _driverManager.InstallWindowsUpdateAsync(_drvWu, t => Dispatcher.BeginInvoke(new Action(() => DrvSet(t, 0.5))));
             DrvSet(r, 1);
             _drvWu = new();
             DrvWuList.Text = r;
@@ -154,7 +155,7 @@ public partial class MainWindow
         _drvCts = new CancellationTokenSource();
         try
         {
-            string r = await DriverManager.BackupAsync(t => Dispatcher.BeginInvoke(new Action(() => DrvSet(t, 0.5))), _drvCts.Token);
+            string r = await _driverManager.BackupAsync(t => Dispatcher.BeginInvoke(new Action(() => DrvSet(t, 0.5))), _drvCts.Token);
             DrvSet(r, 1);
         }
         catch (Exception ex) { DrvSet("Falhou: " + ex.Message, 0); }

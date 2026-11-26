@@ -1,12 +1,11 @@
 ﻿using System.Diagnostics;
 using System.IO;
 using System.Globalization;
-using System.Management;
-using System.Net.Http;
-using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using GeolabTITools.Application.Features.Windows.Contracts;
+using GeolabTITools.Application.Features.Windows.DTOs;
 
 namespace ResetExplode;
 
@@ -54,69 +53,45 @@ public sealed class BoardInfo
     public string SupportUrl { get; set; } = "";
 }
 
-/// <summary>Um driver disponível no Windows Update.</summary>
-public sealed class WuDriver
-{
-    public string Title { get; init; } = "";
-    public long SizeBytes { get; init; }
-    public object? Update { get; init; }
-}
-
 /// <summary>
 /// Inventário, verificação de versão e instalação de drivers. Só NVIDIA tem API pública de versão e download direto;
 /// AMD e os fabricantes de placa-mãe abrem a página oficial já com o modelo detectado. O Windows Update cobre o resto.
 /// </summary>
-public static class DriverManager
+public sealed class DriverManager(
+    IProcessExecutionService processes,
+    IFileSystemService fileSystem,
+    IDownloadService downloads,
+    IHardwareInventoryService hardwareInventory,
+    IAuthenticodeSignatureVerifier signatureVerifier,
+    IWindowsUpdateService windowsUpdate)
 {
-    private static readonly HttpClient Http = CreateClient();
-
-    private static HttpClient CreateClient()
-    {
-        var c = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
-        c.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) GeolabTITools");
-        return c;
-    }
+    private readonly IProcessExecutionService _processes = processes;
+    private readonly IFileSystemService _fileSystem = fileSystem;
+    private readonly IDownloadService _downloads = downloads;
+    private readonly IHardwareInventoryService _hardwareInventory = hardwareInventory;
+    private readonly IAuthenticodeSignatureVerifier _signatureVerifier = signatureVerifier;
+    private readonly IWindowsUpdateService _windowsUpdate = windowsUpdate;
 
     public static string DownloadFolder => Path.Combine(Path.GetTempPath(), "ResetExplode", "drivers");
 
-    // ------------------------------------------------------------------ WMI
-
-    private static string? Str(ManagementBaseObject o, string p) => o[p]?.ToString()?.Trim();
-
-    private static string WmiDate(string? s)
-    {
-        try { if (!string.IsNullOrEmpty(s)) return ManagementDateTimeConverter.ToDateTime(s).ToString("dd/MM/yyyy"); } catch { }
-        return "—";
-    }
-
     /// <summary>Drivers instalados (sem os genéricos da Microsoft, exceto vídeo, rede e áudio).</summary>
-    public static List<DriverRow> Inventory()
+    public async Task<List<DriverRow>> InventoryAsync(CancellationToken cancellationToken = default)
     {
-        var list = new List<DriverRow>();
-        try
-        {
-            using var s = new ManagementObjectSearcher("SELECT DeviceName, DeviceClass, Manufacturer, DriverVersion, DriverDate, IsSigned FROM Win32_PnPSignedDriver");
-            foreach (ManagementObject o in s.Get())
+        IReadOnlyList<InstalledDriverInfo> rows;
+        try { rows = await _hardwareInventory.GetInstalledDriversAsync(cancellationToken); }
+        catch (OperationCanceledException) { throw; }
+        catch { return new List<DriverRow>(); }
+        return rows.Where(row => row.DeviceName.Length > 0)
+            .Where(row => row.DeviceClass is "DISPLAY" or "NET" or "MEDIA" or "BLUETOOTH" or "HDC" or "SCSIADAPTER" or "USB" or "SYSTEM")
+            .Where(row => !row.Manufacturer.StartsWith("Microsoft", StringComparison.OrdinalIgnoreCase)
+                          || row.DeviceClass is "DISPLAY" or "NET" or "MEDIA")
+            .Select(row => new DriverRow
             {
-                string name = Str(o, "DeviceName") ?? "";
-                if (name.Length == 0) continue;
-                string cls = Str(o, "DeviceClass") ?? "";
-                string maker = Str(o, "Manufacturer") ?? "";
-                bool main = cls is "DISPLAY" or "NET" or "MEDIA" or "BLUETOOTH" or "HDC" or "SCSIADAPTER" or "USB" or "SYSTEM";
-                if (maker.StartsWith("Microsoft", StringComparison.OrdinalIgnoreCase) && cls is not ("DISPLAY" or "NET" or "MEDIA")) continue;
-                if (!main) continue;
-                list.Add(new DriverRow
-                {
-                    Device = name, Class = cls, Vendor = maker,
-                    Version = Str(o, "DriverVersion") ?? "—",
-                    Date = WmiDate(Str(o, "DriverDate")),
-                    Signed = o["IsSigned"] is bool b && b
-                });
-                o.Dispose();
-            }
-        }
-        catch { }
-        return list.OrderBy(r => r.Class).ThenBy(r => r.Device).ToList();
+                Device = row.DeviceName, Class = row.DeviceClass, Vendor = row.Manufacturer,
+                Version = string.IsNullOrEmpty(row.DriverVersion) ? "—" : row.DriverVersion,
+                Date = string.IsNullOrEmpty(row.DriverDate) ? "—" : row.DriverDate, Signed = row.IsSigned,
+            })
+            .OrderBy(row => row.Class).ThenBy(row => row.Device).ToList();
     }
 
     /// <summary>"31.0.15.4601" (NVIDIA) vira "546.01".</summary>
@@ -132,45 +107,43 @@ public static class DriverManager
 
     // ------------------------------------------------------------------ GPU
 
-    public static List<GpuDriverStatus> ReadGpus()
+    public async Task<List<GpuDriverStatus>> ReadGpusAsync(CancellationToken cancellationToken = default)
     {
         var list = new List<GpuDriverStatus>();
-        try
+        IReadOnlyList<VideoControllerInfo> controllers;
+        try { controllers = await _hardwareInventory.GetVideoControllersAsync(cancellationToken); }
+        catch (OperationCanceledException) { throw; }
+        catch { return list; }
+        foreach (var controller in controllers)
         {
-            using var s = new ManagementObjectSearcher("SELECT Name, DriverVersion, AdapterCompatibility FROM Win32_VideoController");
-            foreach (ManagementObject o in s.Get())
+            string name = controller.Name;
+            string maker = controller.AdapterCompatibility + " " + name;
+            string ver = controller.DriverVersion;
+            if (name.Length == 0 || name.Contains("Microsoft Basic", StringComparison.OrdinalIgnoreCase)) continue;
+            var g = new GpuDriverStatus { GpuName = name };
+            if (maker.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase))
             {
-                string name = Str(o, "Name") ?? "";
-                string maker = (Str(o, "AdapterCompatibility") ?? "") + " " + name;
-                string ver = Str(o, "DriverVersion") ?? "";
-                if (name.Length == 0 || name.Contains("Microsoft Basic", StringComparison.OrdinalIgnoreCase)) continue;
-                var g = new GpuDriverStatus { GpuName = name };
-                if (maker.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase))
-                {
-                    g.Vendor = "NVIDIA"; g.Installed = NvidiaFriendly(ver);
-                    g.OfficialPage = "https://www.nvidia.com/Download/index.aspx";
-                }
-                else if (maker.Contains("AMD", StringComparison.OrdinalIgnoreCase) || maker.Contains("Radeon", StringComparison.OrdinalIgnoreCase) || maker.Contains("Advanced Micro", StringComparison.OrdinalIgnoreCase))
-                {
-                    g.Vendor = "AMD"; g.Installed = ver;
-                    g.OfficialPage = "https://www.amd.com/en/support/download/drivers.html";
-                }
-                else if (maker.Contains("Intel", StringComparison.OrdinalIgnoreCase))
-                {
-                    g.Vendor = "Intel"; g.Installed = ver;
-                    g.OfficialPage = "https://www.intel.com/content/www/us/en/download-center/home.html";
-                }
-                else { g.Vendor = ""; g.Installed = ver; }
-                list.Add(g);
-                o.Dispose();
+                g.Vendor = "NVIDIA"; g.Installed = NvidiaFriendly(ver);
+                g.OfficialPage = "https://www.nvidia.com/Download/index.aspx";
             }
+            else if (maker.Contains("AMD", StringComparison.OrdinalIgnoreCase) || maker.Contains("Radeon", StringComparison.OrdinalIgnoreCase) || maker.Contains("Advanced Micro", StringComparison.OrdinalIgnoreCase))
+            {
+                g.Vendor = "AMD"; g.Installed = ver;
+                g.OfficialPage = "https://www.amd.com/en/support/download/drivers.html";
+            }
+            else if (maker.Contains("Intel", StringComparison.OrdinalIgnoreCase))
+            {
+                g.Vendor = "Intel"; g.Installed = ver;
+                g.OfficialPage = "https://www.intel.com/content/www/us/en/download-center/home.html";
+            }
+            else { g.Vendor = ""; g.Installed = ver; }
+            list.Add(g);
         }
-        catch { }
         return list;
     }
 
     /// <summary>Consulta a versão mais recente na NVIDIA (mesmo serviço da página oficial de drivers).</summary>
-    public static async Task CheckNvidiaAsync(GpuDriverStatus g, bool studio, CancellationToken ct)
+    public async Task CheckNvidiaAsync(GpuDriverStatus g, bool studio, CancellationToken ct)
     {
         g.Latest = ""; g.DownloadUrl = ""; g.SizeText = "";
         try
@@ -179,7 +152,7 @@ public static class DriverManager
             string url = "https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php" +
                          $"?func=DriverManualLookup&psid={psid}&pfid={pfid}&osID=57&languageCode=1033&beta=0&isWHQL=1&dch=1" +
                          $"&upCRD={(studio ? 1 : 0)}&qnf=0&sort1=1&numberOfResults=1";
-            string json = await Http.GetStringAsync(url, ct);
+            string json = await _downloads.GetStringAsync(new Uri(url), null, ensureSuccessStatusCode: true, ct);
             using var doc = JsonDocument.Parse(json);
             string? ver = null, dl = null, size = null;
             Find(doc.RootElement, ref ver, ref dl, ref size);
@@ -202,7 +175,7 @@ public static class DriverManager
     /// AMD não tem API de versão: abre a página oficial do modelo (a URL segue um padrão) e procura o link direto do instalador.
     /// Se o site mudar ou bloquear, cai para abrir a página manualmente.
     /// </summary>
-    public static async Task CheckAmdAsync(GpuDriverStatus g, CancellationToken ct)
+    public async Task CheckAmdAsync(GpuDriverStatus g, CancellationToken ct)
     {
         g.Latest = ""; g.DownloadUrl = ""; g.SizeText = "";
         try
@@ -214,10 +187,8 @@ public static class DriverManager
             string suffix = m.Groups[2].Success ? "-" + m.Groups[2].Value.ToLowerInvariant() : "";
             string page = $"https://www.amd.com/en/support/downloads/drivers.html/graphics/radeon-rx/{fam}/amd-radeon-rx-{n}{suffix}.html";
             g.OfficialPage = page;
-            using var req = new HttpRequestMessage(HttpMethod.Get, page);
-            req.Headers.Referrer = new Uri("https://www.amd.com/");
-            using var resp = await Http.SendAsync(req, ct);
-            string html = await resp.Content.ReadAsStringAsync(ct);
+            string html = await _downloads.GetStringAsync(new Uri(page), new Uri("https://www.amd.com/"),
+                ensureSuccessStatusCode: false, ct);
             var hit = Regex.Match(html, @"https://drivers\.amd\.com/drivers/[^""'\s<>\\]*win11[^""'\s<>\\]*\.exe", RegexOptions.IgnoreCase);
             if (!hit.Success) hit = Regex.Match(html, @"https://drivers\.amd\.com/drivers/[^""'\s<>\\]*\.exe", RegexOptions.IgnoreCase);
             if (!hit.Success) { g.Message = "AMD: o site não devolveu o link do instalador (pode estar protegido). Abra a página oficial do seu modelo."; return; }
@@ -250,7 +221,7 @@ public static class DriverManager
     }
 
     /// <summary>Descobre os códigos de série (psid) e produto (pfid) da placa na base de drivers da NVIDIA.</summary>
-    private static async Task<(int psid, int pfid)> ResolveNvidiaIdsAsync(string gpuName, CancellationToken ct)
+    private async Task<(int psid, int pfid)> ResolveNvidiaIdsAsync(string gpuName, CancellationToken ct)
     {
         bool mobile = Regex.IsMatch(gpuName, @"Laptop|Max-Q|Mobile|Notebook", RegexOptions.IgnoreCase);
         var m = Regex.Match(gpuName, @"(RTX|GTX|GT)\s*(\d{3,4})", RegexOptions.IgnoreCase);
@@ -267,7 +238,8 @@ public static class DriverManager
         else series = $"{n / 100 * 100} Series";
         if (prefix == "RTX" && n >= 2000) series = $"RTX {n / 100} Series";
 
-        string xml = await Http.GetStringAsync("https://www.nvidia.com/Download/API/lookupValueSearch.aspx?TypeID=2&ParentID=1", ct);
+        string xml = await _downloads.GetStringAsync(new Uri("https://www.nvidia.com/Download/API/lookupValueSearch.aspx?TypeID=2&ParentID=1"), null,
+            ensureSuccessStatusCode: true, ct);
         var seriesList = XDocument.Parse(xml).Descendants("LookupValue")
             .Select(x => (Name: (string?)x.Element("Name") ?? "", Value: (string?)x.Element("Value") ?? "")).ToList();
         var cand = seriesList.Where(s => s.Name.Contains(series, StringComparison.OrdinalIgnoreCase)
@@ -275,7 +247,8 @@ public static class DriverManager
         if (cand.Count == 0) throw new InvalidOperationException("Série da placa não encontrada na NVIDIA (" + series + ").");
         int psid = int.Parse(cand[0].Value);
 
-        xml = await Http.GetStringAsync($"https://www.nvidia.com/Download/API/lookupValueSearch.aspx?TypeID=3&ParentID={psid}", ct);
+        xml = await _downloads.GetStringAsync(new Uri($"https://www.nvidia.com/Download/API/lookupValueSearch.aspx?TypeID=3&ParentID={psid}"), null,
+            ensureSuccessStatusCode: true, ct);
         var prods = XDocument.Parse(xml).Descendants("LookupValue")
             .Select(x => (Name: (string?)x.Element("Name") ?? "", Value: (string?)x.Element("Value") ?? "")).ToList();
         if (prods.Count == 0) throw new InvalidOperationException("Nenhum produto listado para a série.");
@@ -287,94 +260,75 @@ public static class DriverManager
     }
 
     /// <summary>Baixa o instalador, confere a assinatura da NVIDIA e abre o instalador oficial.</summary>
-    public static async Task<string> DownloadAndLaunchAsync(GpuDriverStatus g, Action<string, double> progress, CancellationToken ct)
+    public async Task<string> DownloadAndLaunchAsync(GpuDriverStatus g, Action<string, double> progress, CancellationToken ct)
     {
-        Directory.CreateDirectory(DownloadFolder);
+        _fileSystem.CreateDirectory(DownloadFolder);
         string file = Path.Combine(DownloadFolder, Path.GetFileName(new Uri(g.DownloadUrl).AbsolutePath));
         progress("Baixando o driver…", 0);
-        using var dreq = new HttpRequestMessage(HttpMethod.Get, g.DownloadUrl);
-        if (g.Vendor == "AMD") dreq.Headers.Referrer = new Uri("https://www.amd.com/");
-        using (var resp = await Http.SendAsync(dreq, HttpCompletionOption.ResponseHeadersRead, ct))
+        var downloadProgress = new Progress<DownloadProgress>(p =>
         {
-            resp.EnsureSuccessStatusCode();
-            long total = resp.Content.Headers.ContentLength ?? 0;
-            await using var src = await resp.Content.ReadAsStreamAsync(ct);
-            await using var dst = File.Create(file);
-            var buf = new byte[1 << 20]; long done = 0; int r;
-            var sw = Stopwatch.StartNew();
-            while ((r = await src.ReadAsync(buf, ct)) > 0)
-            {
-                await dst.WriteAsync(buf.AsMemory(0, r), ct);
-                done += r;
-                double mb = done / 1048576.0, speed = mb / Math.Max(0.1, sw.Elapsed.TotalSeconds);
-                progress($"Baixando… {mb:F0} de {(total > 0 ? (total / 1048576.0).ToString("F0") : "?")} MB · {speed:F1} MB/s",
-                         total > 0 ? (double)done / total : 0);
-            }
-        }
+            double mb = p.BytesReceived / 1048576.0;
+            double speed = p.BytesPerSecond / 1048576.0;
+            progress($"Baixando… {mb:F0} de {(p.TotalBytes is > 0 ? (p.TotalBytes.Value / 1048576.0).ToString("F0") : "?")} MB · {speed:F1} MB/s",
+                p.TotalBytes is > 0 ? (double)p.BytesReceived / p.TotalBytes.Value : 0);
+        });
+        await _downloads.DownloadAsync(new Uri(g.DownloadUrl), file,
+            g.Vendor == "AMD" ? new Uri("https://www.amd.com/") : null, downloadProgress, ct);
 
         progress("Conferindo a assinatura digital…", 1);
         VerifyPublisher(file, g.Vendor == "AMD" ? "Advanced Micro Devices" : "NVIDIA");
 
         progress("Criando ponto de restauração (se o Windows permitir)…", 1);
-        string restore = await TryRestorePointAsync();
+        string restore = await TryRestorePointAsync(ct);
 
-        Process.Start(new ProcessStartInfo(file) { UseShellExecute = true, WorkingDirectory = DownloadFolder });
+        await _processes.ExecuteAsync(new ProcessExecutionRequest(file, Array.Empty<string>(), DownloadFolder,
+            WaitForExit: false), ct);
         return $"Instalador {g.Latest} aberto (assinatura {g.Vendor} válida). {restore} Siga o instalador; a tela pode piscar durante a instalação.";
     }
 
-    private static void VerifyPublisher(string path, string publisher)
+    private void VerifyPublisher(string path, string publisher)
     {
-        int trust = AuthenticodeVerifier.WinVerifyTrustFile(path);
-        if (trust != 0)
+        var verification = _signatureVerifier.Verify(path);
+        if (!verification.Trusted)
         {
-            try { File.Delete(path); } catch { }
-            throw new InvalidOperationException($"Assinatura digital inválida (0x{trust:X8}). O arquivo foi descartado.");
+            try { _fileSystem.DeleteFile(path); } catch { }
+            throw new InvalidOperationException($"Assinatura digital inválida (0x{verification.TrustStatus:X8}). O arquivo foi descartado.");
         }
-        string signer = "";
-        try
-        {
-#pragma warning disable SYSLIB0057
-            using var cert = X509Certificate.CreateFromSignedFile(path);
-            signer = new X509Certificate2(cert).Subject;
-#pragma warning restore SYSLIB0057
-        }
-        catch { }
+        string signer = verification.Signer ?? "";
         if (!signer.Contains(publisher, StringComparison.OrdinalIgnoreCase))
         {
-            try { File.Delete(path); } catch { }
+            try { _fileSystem.DeleteFile(path); } catch { }
             throw new InvalidOperationException($"O arquivo está assinado por outro fabricante ({signer}). Foi descartado.");
         }
     }
 
-    private static async Task<string> TryRestorePointAsync()
+    private async Task<string> TryRestorePointAsync(CancellationToken cancellationToken)
     {
         try
         {
-            var psi = new ProcessStartInfo("powershell.exe",
-                "-NoProfile -NonInteractive -Command \"Checkpoint-Computer -Description 'GEOLAB TI TOOLS - antes do driver' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop\"")
-            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true };
-            using var p = Process.Start(psi)!;
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            await p.WaitForExitAsync(cts.Token);
-            return p.ExitCode == 0 ? "Ponto de restauração criado." : "Ponto de restauração não criado (proteção do sistema desligada ou já criado hoje).";
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(60));
+            var result = await _processes.ExecuteAsync(new ProcessExecutionRequest(
+                "powershell.exe",
+                new[] { "-NoProfile", "-NonInteractive", "-Command", "Checkpoint-Computer -Description 'GEOLAB TI TOOLS - antes do driver' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop" },
+                WaitForExit: true, CaptureOutput: true), timeout.Token);
+            return result.ExitCode == 0 ? "Ponto de restauração criado." : "Ponto de restauração não criado (proteção do sistema desligada ou já criado hoje).";
         }
         catch { return "Ponto de restauração não criado."; }
     }
 
     // ------------------------------------------------------------------ Placa-mãe
 
-    public static BoardInfo ReadBoard()
+    public async Task<BoardInfo> ReadBoardAsync(CancellationToken cancellationToken = default)
     {
         var b = new BoardInfo();
         try
         {
-            using (var s = new ManagementObjectSearcher("SELECT Manufacturer, Product FROM Win32_BaseBoard"))
-                foreach (ManagementObject o in s.Get()) { b.Maker = Str(o, "Manufacturer") ?? ""; b.Model = Str(o, "Product") ?? ""; break; }
-            using (var s = new ManagementObjectSearcher("SELECT SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS"))
-                foreach (ManagementObject o in s.Get()) { b.Bios = $"{Str(o, "SMBIOSBIOSVersion")} ({WmiDate(Str(o, "ReleaseDate"))})"; break; }
-            string sys = "", sysModel = "";
-            using (var s = new ManagementObjectSearcher("SELECT Manufacturer, Model FROM Win32_ComputerSystem"))
-                foreach (ManagementObject o in s.Get()) { sys = Str(o, "Manufacturer") ?? ""; sysModel = Str(o, "Model") ?? ""; break; }
+            var hardware = await _hardwareInventory.GetBoardSystemInfoAsync(cancellationToken);
+            b.Maker = hardware.BoardManufacturer;
+            b.Model = hardware.BoardProduct;
+            b.Bios = hardware.BiosDescription;
+            string sys = hardware.SystemManufacturer, sysModel = hardware.SystemModel;
 
             string all = b.Maker + " " + sys;
             string q = Uri.EscapeDataString(b.Model.Length > 0 && !b.Model.Contains("Default", StringComparison.OrdinalIgnoreCase) ? b.Model : sysModel);
@@ -393,62 +347,42 @@ public static class DriverManager
             if (b.Maker.Length == 0) b.Maker = sys;
             if (b.Model.Length == 0) b.Model = sysModel;
         }
+        catch (OperationCanceledException) { throw; }
         catch { }
         return b;
     }
 
     // ------------------------------------------------------------------ Windows Update
 
-    private static dynamic NewCom(string progId)
-        => Activator.CreateInstance(Type.GetTypeFromProgID(progId) ?? throw new InvalidOperationException("Serviço do Windows Update indisponível."))!;
+    public Task<IReadOnlyList<WindowsUpdateDriverInfo>> SearchWindowsUpdateAsync(CancellationToken cancellationToken = default) =>
+        _windowsUpdate.SearchDriversAsync(cancellationToken);
 
-    public static Task<List<WuDriver>> SearchWindowsUpdateAsync() => Task.Run(() =>
-    {
-        var list = new List<WuDriver>();
-        dynamic session = NewCom("Microsoft.Update.Session");
-        dynamic searcher = session.CreateUpdateSearcher();
-        dynamic result = searcher.Search("IsInstalled=0 and Type='Driver' and IsHidden=0");
-        foreach (dynamic u in result.Updates)
-            list.Add(new WuDriver { Title = (string)u.Title, SizeBytes = (long)Convert.ToInt64(u.MaxDownloadSize), Update = u });
-        return list;
-    });
+    public Task<string> InstallWindowsUpdateAsync(IReadOnlyList<WindowsUpdateDriverInfo> items, Action<string> progress,
+        CancellationToken cancellationToken = default) =>
+        _windowsUpdate.InstallDriversAsync(items, new InlineProgress(progress), cancellationToken);
 
-    public static Task<string> InstallWindowsUpdateAsync(List<WuDriver> items, Action<string> progress) => Task.Run(() =>
+    private sealed class InlineProgress(Action<string> callback) : IProgress<string>
     {
-        dynamic session = NewCom("Microsoft.Update.Session");
-        dynamic coll = NewCom("Microsoft.Update.UpdateColl");
-        foreach (var d in items) { dynamic u = d.Update!; try { u.AcceptEula(); } catch { } coll.Add(u); }
-        progress("Baixando drivers do Windows Update…");
-        dynamic dl = session.CreateUpdateDownloader();
-        dl.Updates = coll;
-        dl.Download();
-        progress("Instalando…");
-        dynamic inst = session.CreateUpdateInstaller();
-        inst.Updates = coll;
-        dynamic res = inst.Install();
-        int code = (int)res.ResultCode; // 2 = sucesso, 3 = sucesso com erros
-        bool reboot = (bool)res.RebootRequired;
-        string r = code is 2 or 3 ? "Instalação concluída." : $"Instalação terminou com código {code}.";
-        return r + (reboot ? " Reinicie o PC para finalizar." : "");
-    });
+        public void Report(string value) => callback(value);
+    }
 
     // ------------------------------------------------------------------ Backup
 
     /// <summary>Exporta todos os drivers de terceiros para uma pasta (pnputil). Serve para reinstalar depois de formatar.</summary>
-    public static async Task<string> BackupAsync(Action<string> progress, CancellationToken ct)
+    public async Task<string> BackupAsync(Action<string> progress, CancellationToken ct)
     {
         string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                                   "Geolab-TI-Tools-Drivers", DateTime.Now.ToString("yyyyMMdd-HHmm"));
-        Directory.CreateDirectory(dir);
-        var psi = new ProcessStartInfo("pnputil.exe", $"/export-driver * \"{dir}\"")
-        { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
-        using var p = Process.Start(psi)!;
+        _fileSystem.CreateDirectory(dir);
         int n = 0;
-        string? line;
-        while ((line = await p.StandardOutput.ReadLineAsync(ct)) != null)
+        var outputProgress = new Progress<string>(line =>
+        {
             if (line.Contains(".inf", StringComparison.OrdinalIgnoreCase)) progress($"Exportando drivers… {++n}");
-        await p.WaitForExitAsync(ct);
-        int folders = Directory.GetDirectories(dir).Length;
+        });
+        await _processes.ExecuteAsync(new ProcessExecutionRequest(
+            "pnputil.exe", new[] { "/export-driver", "*", dir },
+            WaitForExit: true, CaptureOutput: true, StandardOutputProgress: outputProgress), ct);
+        int folders = _fileSystem.EnumerateDirectories(dir).Count;
         return folders > 0 ? $"{folders} drivers salvos em {dir}" : "Nada foi exportado (execute o programa como administrador).";
     }
 }

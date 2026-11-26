@@ -45,6 +45,11 @@ public partial class App : Application
         registrations.AddSingleton<IDiskFileQueryService, DiskFileQueryService>();
         registrations.AddSingleton<IDiskClipboardService, WpfDiskClipboardService>();
         registrations.AddSingleton<IDriveMapReader, DriveMapReader>();
+        registrations.AddSingleton<WindowsTweaks>();
+        registrations.AddSingleton<StartupManager>();
+        registrations.AddSingleton<DriverManager>();
+        registrations.AddSingleton<MakerDrivers>();
+        registrations.AddSingleton<Optimizer>();
         registrations.AddTransient<SystemViewModel>();
         registrations.AddTransient<DiskAnalyzerViewModel>();
         registrations.AddSingleton<MainWindow>();

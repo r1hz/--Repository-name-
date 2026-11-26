@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using GeolabTITools.Application.Features.Windows.Contracts;
 using GeolabTITools.Application.Features.Windows.DTOs;
 
@@ -27,6 +28,8 @@ public sealed class ProcessExecutionService : IProcessExecutionService
             CreateNoWindow = !request.RunAsAdministrator,
             RedirectStandardOutput = request.CaptureOutput,
             RedirectStandardError = request.CaptureOutput,
+            StandardOutputEncoding = request.CaptureOutput ? request.StandardOutputEncoding : null,
+            StandardErrorEncoding = request.CaptureOutput ? request.StandardErrorEncoding : null,
         };
 
         foreach (var argument in request.Arguments)
@@ -40,14 +43,45 @@ public sealed class ProcessExecutionService : IProcessExecutionService
             return new ProcessExecutionResult(true, null, "", "");
 
         Task<string> stdout = request.CaptureOutput
-            ? process.StandardOutput.ReadToEndAsync(cancellationToken)
+            ? request.StandardOutputProgress is null
+                ? process.StandardOutput.ReadToEndAsync(cancellationToken)
+                : ReadOutputLinesAsync(process.StandardOutput, request.StandardOutputProgress, cancellationToken)
             : Task.FromResult("");
         Task<string> stderr = request.CaptureOutput
             ? process.StandardError.ReadToEndAsync(cancellationToken)
             : Task.FromResult("");
 
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-        await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
-        return new ProcessExecutionResult(true, process.ExitCode, await stdout.ConfigureAwait(false), await stderr.ConfigureAwait(false));
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
+            return new ProcessExecutionResult(true, process.ExitCode, await stdout.ConfigureAwait(false), await stderr.ConfigureAwait(false));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation applies to the child process too; do not leave a pnputil/powercfg operation orphaned.
+            try
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+            throw;
+        }
+    }
+
+    private static async Task<string> ReadOutputLinesAsync(
+        StreamReader reader,
+        IProgress<string> progress,
+        CancellationToken cancellationToken)
+    {
+        var output = new StringBuilder();
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            output.AppendLine(line);
+            progress.Report(line);
+        }
+        return output.ToString();
     }
 }

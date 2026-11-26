@@ -1,8 +1,8 @@
-using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Xml.Linq;
-using Microsoft.Win32;
+using GeolabTITools.Application.Features.Windows.Contracts;
+using GeolabTITools.Application.Features.Windows.DTOs;
 
 namespace ResetExplode;
 
@@ -58,8 +58,17 @@ public sealed class SerialDriverPackage
 /// Dispositivos, reinstalação do dispositivo, remoção de versões do driver (com backup) e instalação dos drivers oficiais embutidos no app.
 /// Tudo via pnputil e SetupAPI, que já vêm no Windows. Requer administrador.
 /// </summary>
-public static class MakerDrivers
+public sealed class MakerDrivers(
+    IRegistryAccess registry,
+    IProcessExecutionService processes,
+    IFileSystemService fileSystem,
+    IProcessManagementService processManagement, IUsbDeviceService usbDevices)
 {
+    private readonly IRegistryAccess _registry = registry;
+    private readonly IProcessExecutionService _processes = processes;
+    private readonly IFileSystemService _fileSystem = fileSystem;
+    private readonly IProcessManagementService _processManagement = processManagement;
+    private readonly IUsbDeviceService _usbDevices = usbDevices;
     public static readonly SerialChip[] Chips =
     {
         new("CH340/CH341", new[] { "1A86" }, new[] { "ch341ser.inf", "ch343ser.inf", "ch341s64.inf" }, new[] { "wch" },
@@ -74,16 +83,16 @@ public static class MakerDrivers
             "https://www.arduino.cc/en/software", "Arduino"),
     };
 
-    public static string BackupFolder => Path.Combine(AppSettings.Folder, "DriversSeriais");
+    public string BackupFolder => Path.Combine(AppSettings.Folder, "DriversSeriais");
 
     public static SerialChip? ChipByVid(string? vid) => vid == null ? null : Chips.FirstOrDefault(c => c.Vids.Contains(vid, StringComparer.OrdinalIgnoreCase));
 
     // ------------------------------------------------------------------ dispositivos conectados
 
-    public static List<SerialDeviceRow> ConnectedDevices()
+    public List<SerialDeviceRow> ConnectedDevices()
     {
         var rows = new List<SerialDeviceRow>();
-        foreach (var d in UsbCleaner.List().Where(d => d.Present && ChipByVid(d.Vid) != null))
+        foreach (var d in _usbDevices.ListDevices().Select(UsbDevice.FromInfo).Where(d => d.Present && ChipByVid(d.Vid) != null))
         {
             var chip = ChipByVid(d.Vid)!;
             // FTDI tem dois nós (USB\ barramento + FTDIBUS\ porta): mostra só o da porta, a não ser que o de barramento tenha problema.
@@ -100,13 +109,15 @@ public static class MakerDrivers
         return rows;
     }
 
-    private static (string Provider, string Version, string? Inf) DriverInfo(string? driverKey)
+    private (string Provider, string Version, string? Inf) DriverInfo(string? driverKey)
     {
         if (string.IsNullOrEmpty(driverKey)) return ("", "", null);
         try
         {
-            using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Class\" + driverKey);
-            return (k?.GetValue("ProviderName") as string ?? "", k?.GetValue("DriverVersion") as string ?? "", k?.GetValue("InfPath") as string);
+            string path = @"SYSTEM\CurrentControlSet\Control\Class\" + driverKey;
+            return (_registry.ReadValue(RegistryValue(RegistryRoot.LocalMachine, path, "ProviderName")) as string ?? "",
+                    _registry.ReadValue(RegistryValue(RegistryRoot.LocalMachine, path, "DriverVersion")) as string ?? "",
+                    _registry.ReadValue(RegistryValue(RegistryRoot.LocalMachine, path, "InfPath")) as string);
         }
         catch { return ("", "", null); }
     }
@@ -140,19 +151,19 @@ public static class MakerDrivers
     }
 
     /// <summary>Remove o dispositivo e pede ao Windows para detectar de novo: ele reinstala com o melhor driver disponível.</summary>
-    public static async Task<string> ReinstallAsync(UsbDevice d)
+    public async Task<string> ReinstallAsync(UsbDevice d)
     {
-        var (c1, o1) = await RunAsync("pnputil.exe", $"/remove-device \"{d.InstanceId}\"");
+        var (c1, o1) = await RunAsync("pnputil.exe", new[] { "/remove-device", d.InstanceId });
         await Task.Delay(800);
-        var (_, _) = await RunAsync("pnputil.exe", "/scan-devices");
+        var (_, _) = await RunAsync("pnputil.exe", new[] { "/scan-devices" });
         return c1 == 0 ? "Reinstalado: o Windows detectou o dispositivo de novo." : $"pnputil não conseguiu remover: {LastLine(o1)}";
     }
 
     // ------------------------------------------------------------------ pacotes no driver store
 
-    public static async Task<List<SerialDriverPackage>> DriverPackagesAsync(IEnumerable<SerialDeviceRow> connected)
+    public async Task<List<SerialDriverPackage>> DriverPackagesAsync(IEnumerable<SerialDeviceRow> connected)
     {
-        var (code, xml) = await RunAsync("pnputil.exe", "/enum-drivers /format xml");
+        var (code, xml) = await RunAsync("pnputil.exe", new[] { "/enum-drivers", "/format", "xml" });
         var list = new List<SerialDriverPackage>();
         if (code != 0 || !xml.TrimStart().StartsWith("<")) return list; // Windows sem /format xml (10 antigo): só não lista
         var used = new HashSet<string>(connected.Select(r => r.Inf ?? ""), StringComparer.OrdinalIgnoreCase);
@@ -174,23 +185,23 @@ public static class MakerDrivers
     }
 
     /// <summary>Exporta o pacote para a pasta de backup e o remove do Windows (desinstalando dos dispositivos que o usam).</summary>
-    public static async Task<string> RemovePackageAsync(SerialDriverPackage p)
+    public async Task<string> RemovePackageAsync(SerialDriverPackage p)
     {
         string dir = Path.Combine(BackupFolder, $"{DateTime.Now:yyyyMMdd-HHmmss}-{Path.GetFileNameWithoutExtension(p.OriginalName)}-{p.Version}");
-        Directory.CreateDirectory(dir);
-        var (ce, oe) = await RunAsync("pnputil.exe", $"/export-driver {p.PublishedName} \"{dir}\"");
+        _fileSystem.CreateDirectory(dir);
+        var (ce, oe) = await RunAsync("pnputil.exe", new[] { "/export-driver", p.PublishedName, dir });
         if (ce != 0) return $"Backup falhou, nada foi removido: {LastLine(oe)}";
-        var (cd, od) = await RunAsync("pnputil.exe", $"/delete-driver {p.PublishedName} /uninstall /force");
-        await RunAsync("pnputil.exe", "/scan-devices");
+        var (cd, od) = await RunAsync("pnputil.exe", new[] { "/delete-driver", p.PublishedName, "/uninstall", "/force" });
+        await RunAsync("pnputil.exe", new[] { "/scan-devices" });
         return cd == 0 ? $"{p.Title} removido (backup em {dir})." : $"Não foi possível remover: {LastLine(od)}";
     }
 
-    public static bool HasBackups => Directory.Exists(BackupFolder) && Directory.EnumerateFiles(BackupFolder, "*.inf", SearchOption.AllDirectories).Any();
+    public bool HasBackups => _fileSystem.DirectoryExists(BackupFolder) && _fileSystem.EnumerateFiles(BackupFolder, "*.inf", recursive: true).Count > 0;
 
     /// <summary>Devolve ao Windows todos os drivers removidos por aqui.</summary>
-    public static async Task<string> RestoreBackupsAsync()
+    public async Task<string> RestoreBackupsAsync()
     {
-        var (c, o) = await RunAsync("pnputil.exe", $"/add-driver \"{Path.Combine(BackupFolder, "*.inf")}\" /subdirs /install");
+        var (c, o) = await RunAsync("pnputil.exe", new[] { "/add-driver", Path.Combine(BackupFolder, "*.inf"), "/subdirs", "/install" });
         return c is 0 or 3010 ? "Drivers restaurados." + (c == 3010 ? " Reinicie o PC para finalizar." : "") : $"Falhou: {LastLine(o)}";
     }
 
@@ -248,23 +259,23 @@ public static class MakerDrivers
     /// Extrai o driver embutido para uma pasta temporária e instala com pnputil (caminho oficial do Windows). Funciona com a placa
     /// desconectada: o driver fica no Windows e é usado quando ela for plugada.
     /// </summary>
-    public static async Task<string> InstallBundledAsync(SerialChip c)
+    public async Task<string> InstallBundledAsync(SerialChip c)
     {
         var res = BundleResources(c);
         if (res.Count == 0) return $"O driver do {c.Name} não está incluído nesta versão.";
         string dir = Path.Combine(Path.GetTempPath(), "ResetExplode", "drivers-incluidos", c.Bundle!);
-        if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        if (_fileSystem.DirectoryExists(dir)) _fileSystem.DeleteDirectory(dir, recursive: true);
         foreach (var n in res)
         {
             string rel = n.Replace('\\', '/')[($"{ResPrefix}{c.Bundle}/").Length..];
             string file = Path.Combine(dir, rel.Replace('/', Path.DirectorySeparatorChar));
-            Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+            _fileSystem.CreateDirectory(Path.GetDirectoryName(file)!);
             using var src = typeof(MakerDrivers).Assembly.GetManifestResourceStream(n)!;
-            using var dst = File.Create(file);
+            using var dst = _fileSystem.CreateFile(file);
             await src.CopyToAsync(dst);
         }
-        var (code, output) = await RunAsync("pnputil.exe", $"/add-driver \"{Path.Combine(dir, "*.inf")}\" /subdirs /install");
-        try { Directory.Delete(dir, true); } catch { }
+        var (code, output) = await RunAsync("pnputil.exe", new[] { "/add-driver", Path.Combine(dir, "*.inf"), "/subdirs", "/install" });
+        try { _fileSystem.DeleteDirectory(dir, recursive: true); } catch { }
         return code switch
         {
             0 => $"Driver do {c.Name} instalado.",
@@ -281,24 +292,28 @@ public static class MakerDrivers
         { "serial-monitor", "serial-discovery", "arduino-cli", "putty", "CoolTerm", "ttermpro", "Cura", "UltiMaker-Cura",
           "PrusaSlicer", "Repetier-Host", "pronterface", "MobaXterm", "RealTerm", "Termite" };
 
-    public static List<Process> RunningPortHolders() =>
-        PortHolders.SelectMany(n => { try { return Process.GetProcessesByName(n); } catch { return Array.Empty<Process>(); } }).ToList();
+    public IReadOnlyList<ManagedProcessInfo> RunningPortHolders() =>
+        PortHolders.SelectMany(name => { try { return _processManagement.FindByName(name); } catch { return Array.Empty<ManagedProcessInfo>(); } }).ToList();
 
-    public static bool IdeRunning => Process.GetProcessesByName("Arduino IDE").Length > 0;
+    public bool IdeRunning => _processManagement.IsRunning("Arduino IDE");
 
-    public static string? IdeVersion()
+    public int TerminatePortHolders(IEnumerable<ManagedProcessInfo> processes) =>
+        processes.Count(process => _processManagement.Terminate(process, entireProcessTree: true));
+
+    public string? IdeVersion()
     {
-        foreach (var (hive, view) in new[] { (RegistryHive.LocalMachine, RegistryView.Registry64), (RegistryHive.CurrentUser, RegistryView.Default),
-                                             (RegistryHive.LocalMachine, RegistryView.Registry32) })
+        foreach (var (root, view) in new[] { (RegistryRoot.LocalMachine, RegistryViewMode.Registry64), (RegistryRoot.CurrentUser, RegistryViewMode.Default),
+                                             (RegistryRoot.LocalMachine, RegistryViewMode.Registry32) })
         {
             try
             {
-                using var root = RegistryKey.OpenBaseKey(hive, view).OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall");
-                foreach (var sub in root?.GetSubKeyNames() ?? Array.Empty<string>())
+                var key = new RegistryKeyAddress(root, @"Software\Microsoft\Windows\CurrentVersion\Uninstall", view);
+                foreach (var sub in _registry.EnumerateSubKeys(key))
                 {
-                    using var k = root!.OpenSubKey(sub);
-                    if (k?.GetValue("DisplayName") is string n && n.StartsWith("Arduino IDE", StringComparison.OrdinalIgnoreCase))
-                        return k.GetValue("DisplayVersion") as string ?? n;
+                    string subKey = key.SubKey + "\\" + sub;
+                    if (_registry.ReadValue(RegistryValue(root, subKey, "DisplayName", view)) is string n
+                        && n.StartsWith("Arduino IDE", StringComparison.OrdinalIgnoreCase))
+                        return _registry.ReadValue(RegistryValue(root, subKey, "DisplayVersion", view)) as string ?? n;
                 }
             }
             catch { }
@@ -312,37 +327,34 @@ public static class MakerDrivers
     /// Apaga os índices baixados (package_index/library_index) e a pasta staging do Arduino15. Resolve a IDE travada em
     /// "Downloading index" ou erro ao instalar placas/bibliotecas. As placas e bibliotecas instaladas ficam.
     /// </summary>
-    public static string ClearIdeCache()
+    public string ClearIdeCache()
     {
-        if (!Directory.Exists(Arduino15)) return "Pasta Arduino15 não encontrada (a IDE ainda não foi aberta neste usuário).";
+        if (!_fileSystem.DirectoryExists(Arduino15)) return "Pasta Arduino15 não encontrada (a IDE ainda não foi aberta neste usuário).";
         int n = 0;
-        foreach (var f in Directory.GetFiles(Arduino15, "*_index*.json*"))
-            try { File.Delete(f); n++; } catch { }
+        foreach (var f in _fileSystem.EnumerateFiles(Arduino15, "*_index*.json*"))
+            try { _fileSystem.DeleteFile(f); n++; } catch { }
         string staging = Path.Combine(Arduino15, "staging");
         long freed = 0;
-        if (Directory.Exists(staging))
+        if (_fileSystem.DirectoryExists(staging))
         {
-            try { freed = new DirectoryInfo(staging).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length); } catch { }
-            try { Directory.Delete(staging, true); } catch { }
+            try { freed = _fileSystem.EnumerateFiles(staging, "*", recursive: true).Sum(_fileSystem.GetFileLength); } catch { }
+            try { _fileSystem.DeleteDirectory(staging, recursive: true); } catch { }
         }
         return $"{n} índices apagados e {freed / 1048576.0:0} MB de downloads temporários liberados. A IDE baixa os índices de novo ao abrir.";
     }
 
     // ------------------------------------------------------------------ utilidades
 
-    private static async Task<(int Code, string Output)> RunAsync(string exe, string args)
+    private async Task<(int Code, string Output)> RunAsync(string exe, IReadOnlyList<string> args)
     {
-        var psi = new ProcessStartInfo(exe, args)
-        {
-            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
-        };
-        using var p = Process.Start(psi) ?? throw new InvalidOperationException($"Não foi possível iniciar {exe}.");
-        var o = p.StandardOutput.ReadToEndAsync();
-        var e = p.StandardError.ReadToEndAsync();
-        await p.WaitForExitAsync();
-        return (p.ExitCode, await o + await e);
+        var result = await _processes.ExecuteAsync(new ProcessExecutionRequest(exe, args, WaitForExit: true, CaptureOutput: true,
+            StandardOutputEncoding: Encoding.UTF8, StandardErrorEncoding: Encoding.UTF8));
+        if (!result.Started) throw new InvalidOperationException($"Não foi possível iniciar {exe}.");
+        return (result.ExitCode ?? -1, result.StandardOutput + result.StandardError);
     }
+
+    private static RegistryAddress RegistryValue(RegistryRoot root, string key, string name, RegistryViewMode view = RegistryViewMode.Default) =>
+        new(root, key, name, view);
 
     private static string LastLine(string s) =>
         s.Split('\n', '\r').Select(l => l.Trim()).LastOrDefault(l => l.Length > 0) ?? "";

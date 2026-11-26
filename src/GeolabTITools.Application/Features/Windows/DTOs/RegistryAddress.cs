@@ -11,12 +11,14 @@ public enum RegistryRoot
 
 public enum RegistryDataKind
 {
+    None,
     String,
     ExpandString,
     Binary,
     DWord,
     MultiString,
-    QWord
+    QWord,
+    Unknown
 }
 
 public enum RegistryViewMode

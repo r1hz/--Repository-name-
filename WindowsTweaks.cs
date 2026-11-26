@@ -1,7 +1,6 @@
 using System.ComponentModel;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using Microsoft.Win32;
+using GeolabTITools.Application.Features.Windows.Contracts;
+using GeolabTITools.Application.Features.Windows.DTOs;
 
 namespace ResetExplode;
 
@@ -33,11 +32,17 @@ public sealed class Tweak : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
 }
 
-public static class WindowsTweaks
+public sealed class WindowsTweaks(
+    IRegistryAccess registry,
+    IProcessExecutionService processes,
+    IMouseSettingsService mouseSettings)
 {
     private const string HighPerformance = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+    private readonly IRegistryAccess _registry = registry;
+    private readonly IProcessExecutionService _processes = processes;
+    private readonly IMouseSettingsService _mouseSettings = mouseSettings;
 
-    public static List<Tweak> All() => new()
+    public List<Tweak> All() => new()
     {
         new Tweak
         {
@@ -64,29 +69,29 @@ public static class WindowsTweaks
         RegTweak("gamemode", "Modo de Jogo",
             "Dá prioridade ao jogo e evita que o Windows Update instale ou reinicie durante a partida.",
             "Recomendado ligado (é o padrão do Windows 11).",
-            Registry.CurrentUser, @"Software\Microsoft\GameBar", "AutoGameModeEnabled", on: 1, off: 0, absentMeansOn: true),
+            RegistryRoot.CurrentUser, @"Software\Microsoft\GameBar", "AutoGameModeEnabled", on: 1, off: 0, absentMeansOn: true),
         new Tweak
         {
             Id = "gamedvr", Title = "Desativar gravação em segundo plano (Game DVR)",
             Description = "Desliga a captura contínua do Xbox Game Bar, que grava os últimos minutos de jogo o tempo todo.",
             Effect = "Recupera alguns FPS e reduz uso de GPU/disco. Você perde o \"gravar o que aconteceu\" do Game Bar.",
-            Read = () => (ReadDword(Registry.CurrentUser, @"System\GameConfigStore", "GameDVR_Enabled") ?? 1) == 0 &&
-                         (ReadDword(Registry.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled") ?? 1) == 0,
+            Read = () => (ReadDword(RegistryRoot.CurrentUser, @"System\GameConfigStore", "GameDVR_Enabled") ?? 1) == 0 &&
+                         (ReadDword(RegistryRoot.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled") ?? 1) == 0,
             Write = (on, s) =>
             {
-                SetDword(s, "gamedvr.a", Registry.CurrentUser, @"System\GameConfigStore", "GameDVR_Enabled", on ? 0 : 1);
-                SetDword(s, "gamedvr.b", Registry.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled", on ? 0 : 1);
+                SetDword(s, "gamedvr.a", RegistryRoot.CurrentUser, @"System\GameConfigStore", "GameDVR_Enabled", on ? 0 : 1);
+                SetDword(s, "gamedvr.b", RegistryRoot.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled", on ? 0 : 1);
             },
             Restore = s =>
             {
-                RestoreDword(s, "gamedvr.a", Registry.CurrentUser, @"System\GameConfigStore", "GameDVR_Enabled");
-                RestoreDword(s, "gamedvr.b", Registry.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled");
+                RestoreDword(s, "gamedvr.a", RegistryRoot.CurrentUser, @"System\GameConfigStore", "GameDVR_Enabled");
+                RestoreDword(s, "gamedvr.b", RegistryRoot.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled");
             },
         },
         RegTweak("hags", "Agendamento de GPU acelerado por hardware",
             "A própria placa de vídeo gerencia sua fila de trabalho, em vez da CPU.",
             "Necessário para o Frame Generation do DLSS 3/4. Pode reduzir latência. Requer GPU e driver compatíveis.",
-            Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "HwSchMode", on: 2, off: 1,
+            RegistryRoot.LocalMachine, @"SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "HwSchMode", on: 2, off: 1,
             absentMeansOn: false, needsRestart: true),
         new Tweak
         {
@@ -97,18 +102,18 @@ public static class WindowsTweaks
             Write = (on, s) =>
             {
                 if (!s.TweakBackup.ContainsKey("windowed"))
-                    s.TweakBackup["windowed"] = Registry.CurrentUser.OpenSubKey(DxPath)?.GetValue("DirectXUserGlobalSettings") as string ?? "<ausente>";
+                    s.TweakBackup["windowed"] = ReadString(RegistryRoot.CurrentUser, DxPath, "DirectXUserGlobalSettings") ?? "<ausente>";
                 var d = DxSettings();
                 d["SwapEffectUpgradeEnable"] = on ? "1" : "0";
-                using var k = Registry.CurrentUser.CreateSubKey(DxPath);
-                k.SetValue("DirectXUserGlobalSettings", string.Concat(d.Select(kv => $"{kv.Key}={kv.Value};")));
+                _registry.WriteValue(Address(RegistryRoot.CurrentUser, DxPath, "DirectXUserGlobalSettings"),
+                    string.Concat(d.Select(kv => $"{kv.Key}={kv.Value};")), RegistryDataKind.String);
             },
             Restore = s =>
             {
                 if (s.TweakBackup.GetValueOrDefault("windowed") is not string prev) return;
-                using var k = Registry.CurrentUser.CreateSubKey(DxPath);
-                if (prev == "<ausente>") k.DeleteValue("DirectXUserGlobalSettings", false);
-                else k.SetValue("DirectXUserGlobalSettings", prev);
+                var address = Address(RegistryRoot.CurrentUser, DxPath, "DirectXUserGlobalSettings");
+                if (prev == "<ausente>") _registry.DeleteValue(address);
+                else _registry.WriteValue(address, prev, RegistryDataKind.String);
             },
         },
         new Tweak
@@ -116,11 +121,11 @@ public static class WindowsTweaks
             Id = "mouse", Title = "Desligar aceleração do mouse",
             Description = "Desmarca \"Aprimorar precisão do ponteiro\": o cursor anda sempre a mesma distância para o mesmo movimento.",
             Effect = "Não muda FPS, mas deixa a mira consistente em jogos de tiro.",
-            Read = () => ReadString(Registry.CurrentUser, @"Control Panel\Mouse", "MouseSpeed") == "0",
+            Read = () => ReadString(RegistryRoot.CurrentUser, @"Control Panel\Mouse", "MouseSpeed") == "0",
             Write = (on, s) =>
             {
                 foreach (var n in new[] { "MouseSpeed", "MouseThreshold1", "MouseThreshold2" })
-                    if (!s.TweakBackup.ContainsKey($"mouse.{n}")) s.TweakBackup[$"mouse.{n}"] = ReadString(Registry.CurrentUser, @"Control Panel\Mouse", n);
+                    if (!s.TweakBackup.ContainsKey($"mouse.{n}")) s.TweakBackup[$"mouse.{n}"] = ReadString(RegistryRoot.CurrentUser, @"Control Panel\Mouse", n);
                 var v = on ? new[] { "0", "0", "0" } : new[] { "1", "6", "10" }; // padrão do Windows
                 ApplyMouse(v);
             },
@@ -134,7 +139,7 @@ public static class WindowsTweaks
     };
 
     /// <summary>Desfaz tudo que foi alterado pelo app (valores guardados antes da primeira alteração).</summary>
-    public static void RestoreAll(IEnumerable<Tweak> tweaks, AppSettings s)
+    public void RestoreAll(IEnumerable<Tweak> tweaks, AppSettings s)
     {
         foreach (var t in tweaks)
             try { t.Restore(s); } catch { }
@@ -144,7 +149,7 @@ public static class WindowsTweaks
 
     // ------------------------------------------------------------------ registro
 
-    private static Tweak RegTweak(string id, string title, string desc, string effect, RegistryKey hive, string path, string name,
+    private Tweak RegTweak(string id, string title, string desc, string effect, RegistryRoot hive, string path, string name,
                                   int on, int off, bool absentMeansOn, bool needsRestart = false) => new()
     {
         Id = id, Title = title, Description = desc, Effect = effect, NeedsRestart = needsRestart,
@@ -153,41 +158,36 @@ public static class WindowsTweaks
         Restore = s => RestoreDword(s, id, hive, path, name),
     };
 
-    private static int? ReadDword(RegistryKey hive, string path, string name)
+    private int? ReadDword(RegistryRoot hive, string path, string name)
     {
-        using var k = hive.OpenSubKey(path);
-        return k?.GetValue(name) is int v ? v : null;
+        return _registry.ReadValue(Address(hive, path, name)) is int value ? value : null;
     }
 
-    private static string? ReadString(RegistryKey hive, string path, string name)
-    {
-        using var k = hive.OpenSubKey(path);
-        return k?.GetValue(name)?.ToString();
-    }
+    private string? ReadString(RegistryRoot hive, string path, string name) =>
+        _registry.ReadValue(Address(hive, path, name))?.ToString();
 
-    private static void SetDword(AppSettings s, string backupKey, RegistryKey hive, string path, string name, int value)
+    private void SetDword(AppSettings s, string backupKey, RegistryRoot hive, string path, string name, int value)
     {
         if (!s.TweakBackup.ContainsKey(backupKey))
             s.TweakBackup[backupKey] = ReadDword(hive, path, name)?.ToString() ?? "<ausente>";
-        using var k = hive.CreateSubKey(path);
-        k.SetValue(name, value, RegistryValueKind.DWord);
+        _registry.WriteValue(Address(hive, path, name), value, RegistryDataKind.DWord);
     }
 
-    private static void RestoreDword(AppSettings s, string backupKey, RegistryKey hive, string path, string name)
+    private void RestoreDword(AppSettings s, string backupKey, RegistryRoot hive, string path, string name)
     {
         if (s.TweakBackup.GetValueOrDefault(backupKey) is not string prev) return;
-        using var k = hive.CreateSubKey(path);
-        if (prev == "<ausente>") k.DeleteValue(name, false);
-        else k.SetValue(name, int.Parse(prev), RegistryValueKind.DWord);
+        var address = Address(hive, path, name);
+        if (prev == "<ausente>") _registry.DeleteValue(address);
+        else _registry.WriteValue(address, int.Parse(prev), RegistryDataKind.DWord);
     }
 
     private const string DxPath = @"Software\Microsoft\DirectX\UserGpuPreferences";
 
     /// <summary>"Chave=Valor;Chave=Valor;" → dicionário (o valor pode ter outras opções do usuário, que preservamos).</summary>
-    private static Dictionary<string, string> DxSettings()
+    private Dictionary<string, string> DxSettings()
     {
         var d = new Dictionary<string, string>();
-        string raw = Registry.CurrentUser.OpenSubKey(DxPath)?.GetValue("DirectXUserGlobalSettings") as string ?? "";
+        string raw = ReadString(RegistryRoot.CurrentUser, DxPath, "DirectXUserGlobalSettings") ?? "";
         foreach (var part in raw.Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
             var kv = part.Split('=', 2);
@@ -196,38 +196,33 @@ public static class WindowsTweaks
         return d;
     }
 
-    private static void ApplyMouse(string[] v)
+    private void ApplyMouse(string[] v)
     {
-        using (var k = Registry.CurrentUser.CreateSubKey(@"Control Panel\Mouse"))
-        {
-            k.SetValue("MouseSpeed", v[0]);
-            k.SetValue("MouseThreshold1", v[1]);
-            k.SetValue("MouseThreshold2", v[2]);
-        }
+        _registry.WriteValue(Address(RegistryRoot.CurrentUser, @"Control Panel\Mouse", "MouseSpeed"), v[0], RegistryDataKind.String);
+        _registry.WriteValue(Address(RegistryRoot.CurrentUser, @"Control Panel\Mouse", "MouseThreshold1"), v[1], RegistryDataKind.String);
+        _registry.WriteValue(Address(RegistryRoot.CurrentUser, @"Control Panel\Mouse", "MouseThreshold2"), v[2], RegistryDataKind.String);
         // Aplica na hora, sem precisar sair da conta.
-        var p = v.Select(int.Parse).ToArray();
-        SystemParametersInfo(0x0004 /* SPI_SETMOUSE */, 0, p, 0x01 | 0x02);
+        _mouseSettings.ApplyMouseParameters(int.Parse(v[0]), int.Parse(v[1]), int.Parse(v[2]));
     }
 
     // ------------------------------------------------------------------ plano de energia
 
-    private static string? ActiveScheme()
+    private string? ActiveScheme()
     {
         var m = System.Text.RegularExpressions.Regex.Match(PowerCfg("/getactivescheme"), @"[0-9a-fA-F\-]{36}");
         return m.Success ? m.Value.ToLowerInvariant() : null;
     }
 
-    private static string PowerCfg(string args)
+    private string PowerCfg(string args)
     {
-        var psi = new ProcessStartInfo("powercfg.exe", args)
-        {
-            RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
-        };
-        using var p = Process.Start(psi)!;
-        string output = p.StandardOutput.ReadToEnd();
-        p.WaitForExit(5000);
-        return output;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var result = _processes.ExecuteAsync(new ProcessExecutionRequest(
+            "powercfg.exe", args.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            WaitForExit: true, CaptureOutput: true), timeout.Token).GetAwaiter().GetResult();
+        if (!result.Started) throw new InvalidOperationException("Não foi possível iniciar powercfg.exe.");
+        return result.StandardOutput;
     }
 
-    [DllImport("user32.dll")] private static extern bool SystemParametersInfo(uint action, uint param, int[] data, uint winIni);
+    private static RegistryAddress Address(RegistryRoot root, string path, string name) => new(root, path, name);
+
 }

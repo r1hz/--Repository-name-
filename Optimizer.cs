@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
+using GeolabTITools.Application.Features.Windows.Contracts;
+using GeolabTITools.Application.Features.Windows.DTOs;
 
 namespace ResetExplode;
 
@@ -29,8 +30,10 @@ public sealed record CleanupResult(long FreedBytes, int Trimmed, bool StandbyPur
 public sealed record CloseResult(List<string> Closed, List<string> NotClosed);
 
 /// <summary>Limpeza de memória e fechamento de programas em segundo plano.</summary>
-public static class Optimizer
+public sealed class Optimizer(IProcessManagementService processes, IMemoryManagementService memory)
 {
+    private readonly IProcessManagementService _processes = processes;
+    private readonly IMemoryManagementService _memory = memory;
     /// <summary>Processos que nunca aparecem na lista (sistema, segurança, drivers, o próprio app).</summary>
     private static readonly HashSet<string> Protected = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -64,16 +67,16 @@ public static class Optimizer
         ["OfficeClickToRun"] = "Atualizador do Office",
     };
 
-    public static List<BackgroundApp> ListApps()
+    public List<BackgroundApp> ListApps()
     {
-        int session = Process.GetCurrentProcess().SessionId;
-        var groups = new Dictionary<string, List<Process>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in Process.GetProcesses())
+        int session = _processes.CurrentSessionId;
+        var groups = new Dictionary<string, List<ManagedProcessInfo>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in _processes.EnumerateProcesses())
         {
             try
             {
                 if (p.SessionId != session || Protected.Contains(p.ProcessName)) continue;
-                if (!groups.TryGetValue(p.ProcessName, out var list)) groups[p.ProcessName] = list = new List<Process>();
+                if (!groups.TryGetValue(p.ProcessName, out var list)) groups[p.ProcessName] = list = new List<ManagedProcessInfo>();
                 list.Add(p);
             }
             catch { }
@@ -82,15 +85,15 @@ public static class Optimizer
         var result = new List<BackgroundApp>();
         foreach (var (name, procs) in groups)
         {
-            bool hasWindow = procs.Any(p => SafeWindow(p) != IntPtr.Zero);
+            bool hasWindow = procs.Any(p => p.HasMainWindow);
             bool suggested = SuggestedApps.ContainsKey(name);
             if (!hasWindow && !suggested) continue; // processos auxiliares sem janela ficam de fora
 
             string title = name, detail;
-            try { title = procs[0].MainModule?.FileVersionInfo.FileDescription is { Length: > 0 } d ? d : name; } catch { }
+            title = procs[0].Description is { Length: > 0 } description ? description : name;
             detail = suggested ? SuggestedApps[name] : hasWindow ? "Programa aberto" : "";
             if (procs.Count > 1) detail += $" · {procs.Count} processos";
-            long mem = procs.Sum(p => { try { return p.WorkingSet64; } catch { return 0L; } });
+            long mem = procs.Sum(p => p.WorkingSetBytes);
 
             result.Add(new BackgroundApp
             {
@@ -101,32 +104,26 @@ public static class Optimizer
         return result.OrderByDescending(a => a.Suggested).ThenByDescending(a => a.MemoryBytes).ToList();
     }
 
-    private static IntPtr SafeWindow(Process p) { try { return p.MainWindowHandle; } catch { return IntPtr.Zero; } }
-
     /// <summary>
     /// Fecha os programas: com janela → pede para fechar (como clicar no X), sem forçar, para não perder nada
     /// não salvo; sem janela (segundo plano) → encerra.
     /// </summary>
-    public static CloseResult CloseApps(IEnumerable<BackgroundApp> apps)
+    public CloseResult CloseApps(IEnumerable<BackgroundApp> apps)
     {
         var closed = new List<string>();
         var notClosed = new List<string>();
         foreach (var app in apps)
         {
-            var procs = Process.GetProcessesByName(app.ProcessName);
+            var procs = _processes.FindByName(app.ProcessName);
             foreach (var p in procs)
             {
-                try
-                {
-                    if (SafeWindow(p) != IntPtr.Zero) p.CloseMainWindow();
-                    else if (app.Suggested) p.Kill();
-                }
-                catch { }
+                if (p.HasMainWindow) _processes.RequestClose(p);
+                else if (app.Suggested) _processes.Terminate(p);
             }
             // Dá até 4 s para fecharem sozinhos.
             var sw = Stopwatch.StartNew();
-            while (sw.Elapsed.TotalSeconds < 4 && Process.GetProcessesByName(app.ProcessName).Length > 0) Thread.Sleep(200);
-            if (Process.GetProcessesByName(app.ProcessName).Length == 0) closed.Add(app.Title);
+            while (sw.Elapsed.TotalSeconds < 4 && _processes.IsRunning(app.ProcessName)) Thread.Sleep(200);
+            if (!_processes.IsRunning(app.ProcessName)) closed.Add(app.Title);
             else notClosed.Add(app.Title);
         }
         return new CloseResult(closed, notClosed);
@@ -137,75 +134,28 @@ public static class Optimizer
     /// A lista de espera é cache que o Windows libera sozinho quando precisa; esvaziá-la antes de jogar
     /// ajuda quando a RAM está quase cheia e o jogo engasga ao carregar áreas novas.
     /// </summary>
-    public static CleanupResult CleanMemory()
+    public CleanupResult CleanMemory()
     {
-        long before = AvailableBytes();
+        long before = _memory.ReadPhysicalMemoryStatus().AvailableBytes;
         int trimmed = 0;
         int self = Environment.ProcessId;
-        foreach (var p in Process.GetProcesses())
+        foreach (var p in _processes.EnumerateProcesses())
         {
-            try
-            {
-                if (p.Id == self || p.Id <= 4) continue;
-                if (EmptyWorkingSet(p.Handle)) trimmed++;
-            }
-            catch { }
+            if (p.Id == self || p.Id <= 4) continue;
+            if (_memory.TrimProcessWorkingSet(p)) trimmed++;
         }
 
-        bool purged = false;
-        string? error = null;
-        try
-        {
-            EnablePrivilege("SeProfileSingleProcessPrivilege");
-            int command = 4; // MemoryPurgeStandbyList
-            int status = NtSetSystemInformation(80 /* SystemMemoryListInformation */, ref command, sizeof(int));
-            purged = status == 0;
-            if (!purged) error = $"o Windows recusou (0x{status:X8}); é preciso rodar como administrador";
-        }
-        catch (Exception ex) { error = ex.Message; }
+        MemoryOperationResult purge = _memory.PurgeStandbyList();
 
         Thread.Sleep(300);
-        return new CleanupResult(Math.Max(0, AvailableBytes() - before), trimmed, purged, error);
+        return new CleanupResult(Math.Max(0, _memory.ReadPhysicalMemoryStatus().AvailableBytes - before),
+            trimmed, purge.Succeeded, purge.Error);
     }
 
-    public static (long Total, long Available) MemoryStatus()
+    public (long Total, long Available) MemoryStatus()
     {
-        var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
-        return GlobalMemoryStatusEx(ref m) ? ((long)m.ullTotalPhys, (long)m.ullAvailPhys) : (0, 0);
+        var status = _memory.ReadPhysicalMemoryStatus();
+        return (status.TotalBytes, status.AvailableBytes);
     }
 
-    private static long AvailableBytes() => MemoryStatus().Available;
-
-    private static void EnablePrivilege(string name)
-    {
-        if (!OpenProcessToken(Process.GetCurrentProcess().Handle, 0x0020 | 0x0008, out var token)) // ADJUST | QUERY
-            throw new Win32Exception();
-        try
-        {
-            if (!LookupPrivilegeValue(null, name, out long luid)) throw new Win32Exception();
-            var tp = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Luid = luid, Attributes = 2 }; // SE_PRIVILEGE_ENABLED
-            AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
-        }
-        finally { CloseHandle(token); }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MEMORYSTATUSEX
-    {
-        public uint dwLength, dwMemoryLoad;
-        public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
-    }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 4)]
-    private struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public long Luid; public uint Attributes; }
-
-    [DllImport("psapi.dll")] private static extern bool EmptyWorkingSet(IntPtr hProcess);
-    [DllImport("ntdll.dll")] private static extern int NtSetSystemInformation(int infoClass, ref int info, int length);
-    [DllImport("kernel32.dll")] private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX m);
-    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
-    [DllImport("advapi32.dll", SetLastError = true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern bool LookupPrivilegeValue(string? system, string name, out long luid);
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES state, uint len, IntPtr prev, IntPtr retLen);
 }

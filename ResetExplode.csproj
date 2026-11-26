@@ -34,6 +34,9 @@
     <ProjectReference Include="src\GeolabTITools.Application\GeolabTITools.Application.csproj" />
     <ProjectReference Include="src\GeolabTITools.Infrastructure\GeolabTITools.Infrastructure.csproj" />
     <Compile Remove="src\**\*.cs" />
+    <Compile Remove="tests\**\*.cs" />
+    <Compile Remove="bin\**\*.cs" />
+    <Compile Remove="obj\**\*.cs" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="6.0.0" />
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.8" />
